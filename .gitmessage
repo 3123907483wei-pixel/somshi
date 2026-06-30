@@ -1,0 +1,23 @@
+<type>(<scope>): <subject>
+
+# type(类型): feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert
+# scope(范围): 可选，例如 auth、user、api
+# subject(标题): 使用祈使句，小写开头，末尾不加句号，<= 72 字符
+#
+# body(正文): 说明做了什么、为什么做（不是怎么做）。建议 72 字符换行。
+#
+# footer(页脚，可选):
+# BREAKING CHANGE: 描述破坏性变更与迁移说明
+# Closes #123   (关闭 issue)
+# Refs #456     (关联 issue)
+#
+# 示例:
+# feat(auth): add oauth2 login support
+#
+# add github oauth2 flow for web login
+# keep existing jwt login for backward compatibility
+#
+# 新增 GitHub OAuth2 网页登录流程
+# 保留现有 JWT 登录方式以兼容旧版本
+#
+# Closes #123
