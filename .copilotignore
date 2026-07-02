@@ -1,0 +1,28 @@
+# 彻底屏蔽 Python 虚拟环境，防止 Agent 检索第三方库源码
+.venv/
+.venv_cuda/
+venv/
+env/
+__pycache__/
+*.pyc
+
+# 彻底屏蔽前端打包产物和大型依赖
+node_modules/
+dist/
+build/
+
+# 屏蔽多媒体、数据集和大型文档（这些非常吃 Token）
+*.mp4
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.docx
+*.pdf
+dataset/
+data/
+
+# 屏蔽本地日志和敏感配置文件
+*.log
+.env
+.env.local
