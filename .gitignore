@@ -1,0 +1,19 @@
+# 忽略 Python 自动生成的缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 忽略本地虚拟环境 (就是你之前配的虚拟环境文件夹)
+.venv/
+venv/
+ENV/
+
+# 忽略隐私配置
+.env
+
+# 忽略编辑器的本地配置
+.vscode/
+.idea/
+.adk/
+/.adk/
