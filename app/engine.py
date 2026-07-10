@@ -39,10 +39,10 @@ llm = ChatOpenAI(
     temperature=0.7,
 )
 
-# ── MCP Bing Web Search 工具（复用 search_server.py） ──────────────────────
+# ── MCP DuckDuckGo Search 工具（复用 search_server.py） ───────────────────
 @tool
-async def bing_search_tool(query: str, count: int = 5, mkt: str = "zh-CN") -> str:
-    """Search the web using Bing Search API via MCP server."""
+async def duckduckgo_search_tool(query: str, count: int = 5, region: str = "cn-zh") -> str:
+    """Search the web via MCP server (DuckDuckGo, free)."""
     server_params = StdioServerParameters(
         command=sys.executable,
         args=[str(Path(__file__).parent.parent / "servers" / "search_server.py")],
@@ -51,7 +51,7 @@ async def bing_search_tool(query: str, count: int = 5, mkt: str = "zh-CN") -> st
         async with stdio_client(server_params) as (r, w):
             async with ClientSession(r, w) as s:
                 await s.initialize()
-                resp = await s.call_tool("web_search", arguments={"query": query, "count": count, "mkt": mkt})
+                resp = await s.call_tool("web_search", arguments={"query": query, "count": count, "region": region})
                 return resp.content[0].text if resp.content else "No data."
     try:
         return await fetch()
@@ -60,12 +60,12 @@ async def bing_search_tool(query: str, count: int = 5, mkt: str = "zh-CN") -> st
 
 
 async def _fetch_mcp_search(topic: str, titles: list[str]) -> str:
-    """Search Bing for the topic and each section, return compiled research."""
+    """Search DuckDuckGo for the topic and each section, return compiled research."""
     parts = []
     queries = [topic] + titles[:4]
     for q in queries:
         try:
-            raw = await bing_search_tool.ainvoke({"query": q, "count": 3, "region": "cn-zh"})
+            raw = await duckduckgo_search_tool.ainvoke({"query": q, "count": 3, "region": "cn-zh"})
             data = json.loads(raw) if isinstance(raw, str) else raw
             if data.get("status") != "ok":
                 continue
@@ -302,7 +302,7 @@ def validate_outline(state: AgentState) -> dict:
 
 
 def research_topic(state: AgentState) -> dict:
-    """Phase 3.5: search Bing for real-time data on topic + sections via MCP."""
+    """Phase 3.5: search DuckDuckGo for real-time data on topic + sections via MCP."""
     topic = state["topic"]
     titles = state.get("section_titles", [])
     print(f"\n{'='*50}\n🔍 深度调研: {topic}\n{'='*50}")

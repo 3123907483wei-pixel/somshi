@@ -45,23 +45,24 @@
 ## 目录结构
 
 ```
-d:\somshi\
+blog-writer/
 ├── app/                    # 应用核心
 │   ├── __init__.py
 │   ├── engine.py           # LangGraph 工作流 (12 节点 StateGraph)
-│   └── webui.py            # FastAPI Web 前端
+│   └── webui.py            # FastAPI Web 前端 (端口 8000)
 ├── scanners/               # 热点扫描器
 │   ├── __init__.py
-│   ├── trends_scanner.py   # 4 源热点 (HN/GitHub/微博/抖音)
-│   └── crawlers.py         # 爬虫测试工具
-├── mcp/ → servers/       # MCP 服务器（改名避免与 pip 包冲突）
+│   ├── trends_scanner.py   # 4 源并行扫描 (HN/GitHub/微博/抖音)
+│   └── crawlers.py         # 爬虫独立测试工具
+├── servers/                # MCP 服务器
 │   ├── __init__.py
-│   └── search_server.py    # DuckDuckGo Search MCP server
-├── notebooks/
-│   └── 1.ipynb             # 原型归档
+│   └── search_server.py    # DuckDuckGo Search (免费，无需 API Key)
 ├── run.py                  # 命令行入口
+├── Dockerfile              # Docker 构建
+├── docker-compose.yml      # Docker 编排
 ├── .env.example
 ├── requirements.txt
+├── design.md               # 架构设计文档 (含 Mermaid 图)
 └── readme.md
 ```
 
@@ -146,7 +147,7 @@ d:\somshi\
 
 **技术栈**：`langgraph` + `langchain-openai` + `langchain-core` + `mcp`
 
-- 11 个节点的 StateGraph, 覆盖 Map-Reduce / Supervisor / HITL
+- 12 个节点的 StateGraph, 覆盖 Map-Reduce / Supervisor / HITL
 - `Send()` API 实现并行 fan-out（多源扫描 + 按节写作）
 - `interrupt_before` + `Command(resume=...)` 实现 HITL
 - `MemorySaver` checkpointer 支持断点恢复
@@ -206,7 +207,7 @@ d:\somshi\
 | MCP 客户端 | mcp Python SDK (stdio_client) | Agent ↔ MCP 服务器进程间通信 |
 | 数据源 | requests / BeautifulSoup | HN / GitHub / 微博 / 抖音 |
 | 实时搜索 | DuckDuckGo (via MCP) | writing 阶段实时调研，无需 API Key |
-| 持久化 | langgraph.checkpoint.memory (MemorySaver) | HITL 断点恢复 |
+| 持久化 | langgraph.checkpoint.memory (MemorySaver) | 进程级内存，用于 HITL 中断恢复（非持久化） |
 
 ---
 
@@ -280,6 +281,7 @@ uvicorn>=0.20.0
 requests>=2.28.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
+duckduckgo_search>=8.0.0
 ```
 
 ---
