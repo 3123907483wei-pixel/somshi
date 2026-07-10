@@ -19,9 +19,9 @@ from pydantic import BaseModel
 import uvicorn
 
 # Ensure parent dir is in path
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from agent2 import agent, run_pipeline, AgentState
+from app.engine import agent, run_pipeline, AgentState
 from langgraph.types import Command
 
 app = FastAPI(title="Blog Writer Web UI")
@@ -140,7 +140,8 @@ def select_topic(req: SelectRequest):
                         "generate_section_tasks": "dispatching",
                         "write_section": "writing_sections",
                         "merge_and_polish": "merging",
-                        "validate_blog": "validating_article",
+                        "join_sections": "joining",
+                        "quality_evaluate": "evaluating_quality",
                         "finalize": "finalizing",
                     }
                     if node_name in progress_map:
@@ -284,6 +285,9 @@ async function startScan() {
     const d = await r.json();
     if (d.status === 'scanning') {
       pollTimer = setInterval(pollStatus, 1000);
+    } else {
+      setStatus('❌ ' + (d.detail || JSON.stringify(d)), 'error');
+      document.getElementById('start-btn').disabled = false;
     }
   } catch(e) {
     setStatus('❌ 启动失败: ' + e.message, 'error');

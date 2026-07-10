@@ -32,33 +32,28 @@ class TrendItem:
 
 # ── HTTP helpers ────────────────────────────────────────────────────────────
 
-# Fast-fail HTTP helper — no session reuse, no retries, aggressive timeouts.
-# Individual source scanners use their OWN fresh connection per URL so that
-# a blocked source (e.g. Reddit in China) never holds up another source.
-
 TIMEOUT = (2.0, 3.0)  # (connect, read) seconds — aggressive fast fail
+
+# Shared Session for connection reuse (TCP keep-alive, reduces handshake overhead)
+_http = requests.Session()
+_http.headers.update({
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"),
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+})
 
 
 def _get(url: str, headers: Optional[dict] = None) -> Optional[requests.Response]:
-    """Single-shot GET, fresh connection each call, fast fail."""
+    """GET via shared Session — reuses TCP connection for same host."""
     try:
-        h = {
-            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"),
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        }
-        if headers:
-            h.update(headers)
-        resp = requests.get(url, headers=h, timeout=TIMEOUT)
+        resp = _http.get(url, headers=headers, timeout=TIMEOUT)
         resp.raise_for_status()
         return resp
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code in (403, 429):
-            return None  # silent
-        # print(f"  [scan] HTTP {url[:45]}: {e}")
+            return None
         return None
     except Exception:
-        # Silent fail — blocked sources are expected
         return None
 
 

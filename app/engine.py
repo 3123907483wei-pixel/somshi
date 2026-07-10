@@ -7,7 +7,7 @@ Architecture:
   Phase 4 ─ Merge → Validate → Finalize (titles + hooks)
 """
 
-import asyncio, json, os, sys, time
+import asyncio, json, os, sys, time, re
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
@@ -26,7 +26,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 # Local trend scanner
-from trends_scanner import scan_all as scan_all_trends, TrendItem
+from scanners.trends_scanner import scan_all as scan_all_trends, TrendItem
 
 # ── 1. LLM 配置 ──────────────────────────────────────────────────────────────
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -39,24 +39,45 @@ llm = ChatOpenAI(
     temperature=0.7,
 )
 
-# ── MCP Google Trends 工具（复用 server.py） ────────────────────────────────
+# ── MCP Bing Web Search 工具（复用 search_server.py） ──────────────────────
 @tool
-async def google_trends_tool(keyword: str, geo: str = "US", quick: bool = True) -> str:
-    """Get Google Trends signals for a keyword via MCP server."""
+async def bing_search_tool(query: str, count: int = 5, mkt: str = "zh-CN") -> str:
+    """Search the web using Bing Search API via MCP server."""
     server_params = StdioServerParameters(
         command=sys.executable,
-        args=[str(Path(__file__).parent / "server.py")],
+        args=[str(Path(__file__).parent.parent / "servers" / "search_server.py")],
     )
     async def fetch():
         async with stdio_client(server_params) as (r, w):
             async with ClientSession(r, w) as s:
                 await s.initialize()
-                resp = await s.call_tool("trends", arguments={"keyword": keyword, "geo": geo, "quick": quick})
+                resp = await s.call_tool("web_search", arguments={"query": query, "count": count, "mkt": mkt})
                 return resp.content[0].text if resp.content else "No data."
     try:
         return await fetch()
     except Exception as e:
-        return f"MCP call failed: {e}"
+        return f"MCP search call failed: {e}"
+
+
+async def _fetch_mcp_search(topic: str, titles: list[str]) -> str:
+    """Search Bing for the topic and each section, return compiled research."""
+    parts = []
+    queries = [topic] + titles[:4]
+    for q in queries:
+        try:
+            raw = await bing_search_tool.ainvoke({"query": q, "count": 3, "region": "cn-zh"})
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            if data.get("status") != "ok":
+                continue
+            items = data.get("results", [])
+            if items:
+                parts.append(f"=== {q} ===\n" + "\n".join(
+                    f"- {r['title']}: {r['snippet'][:200]}" for r in items
+                ))
+        except Exception:
+            continue
+    return "\n\n".join(parts) if parts else ""
+
 
 # ── AgentState ──────────────────────────────────────────────────────────────
 def merge_dicts(a: dict, b: dict) -> dict:
@@ -81,6 +102,7 @@ class AgentState(TypedDict):
     seo_titles: list
     tweet_hooks: list
     human_feedback: str
+    quality_score: int
 
 # ── 4. 节点函数 ──────────────────────────────────────────────────────────────
 
@@ -94,7 +116,7 @@ def scan_sources(state: AgentState) -> dict:
     t0 = time.time()
     results = scan_all_trends(max_items=8, global_timeout=20)
     elapsed = time.time() - t0
-    print(f"  ⏱ 扫描耗时: {elapsed:.1f}s")
+    print(f"  ⏱ 本地扫描: {elapsed:.1f}s ({len(results)} 条)")
 
     if not results:
         results = [
@@ -168,13 +190,12 @@ Angle: ...
     nc = len(msg.content)
     print(f"\n🤖 Supervisor ({elapsed:.1f}s, {len(prompt)}→{nc}c)")
 
-    # Robust parsing: split by "## TOPIC" headers
+    # Robust parsing: split by "## TOPIC" headers (case-insensitive)
     content = msg.content.strip()
-    if hint:
-        print(content[:300])  # debug
+    print(content[:500])  # debug: always print supervisor output
 
     candidates = []
-    blocks = content.split("## TOPIC")
+    blocks = re.split(r'##\s*TOPIC\s*\d*', content, flags=re.IGNORECASE)
     for block in blocks[1:]:
         item = {}
         # Handle both multi-line and inline " / " formats
@@ -183,13 +204,15 @@ Angle: ...
             lines = lines[0].split(" / ")
         for line in lines:
             line = line.strip()
-            low = line.lower()
+            # Strip markdown bold/italic markers like **Title:** or *Title:*
+            clean = line.replace("**", "").replace("*", "")
+            low = clean.lower()
             if low.startswith("title:"):
-                item["title"] = line[6:].strip()
+                item["title"] = clean[6:].strip()
             elif low.startswith("reason:"):
-                item["reason"] = line[7:].strip()
+                item["reason"] = clean[7:].strip()
             elif low.startswith("angle:"):
-                item["angle"] = line[6:].strip()
+                item["angle"] = clean[6:].strip()
         if item.get("title"):
             candidates.append(item)
 
@@ -198,16 +221,17 @@ Angle: ...
         current = {}
         for line in content.split("\n"):
             line = line.strip()
-            if line.startswith("## TOPIC"):
+            clean = line.replace("**", "").replace("*", "")
+            if clean.startswith("## TOPIC"):
                 if current.get("title"):
                     candidates.append(current)
                 current = {}
-            elif line.startswith("Title:"):
-                current["title"] = line[6:].strip()
-            elif line.startswith("Reason:"):
-                current["reason"] = line[7:].strip()
-            elif line.startswith("Angle:"):
-                current["angle"] = line[6:].strip()
+            elif clean.lower().startswith("title:"):
+                current["title"] = clean[6:].strip()
+            elif clean.lower().startswith("reason:"):
+                current["reason"] = clean[7:].strip()
+            elif clean.lower().startswith("angle:"):
+                current["angle"] = clean[6:].strip()
         if current.get("title"):
             candidates.append(current)
 
@@ -277,6 +301,27 @@ def validate_outline(state: AgentState) -> dict:
     return {"messages": [HumanMessage(content=f"[Outline check] {result}")]}
 
 
+def research_topic(state: AgentState) -> dict:
+    """Phase 3.5: search Bing for real-time data on topic + sections via MCP."""
+    topic = state["topic"]
+    titles = state.get("section_titles", [])
+    print(f"\n{'='*50}\n🔍 深度调研: {topic}\n{'='*50}")
+    t0 = time.time()
+    # 安全调用 async: 创建独立事件循环，避免 FastAPI 环境中炸
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        research = loop.run_until_complete(_fetch_mcp_search(topic, titles))
+    finally:
+        loop.close()
+    elapsed = time.time() - t0
+    if research:
+        print(f"  ⏱ 调研: {elapsed:.1f}s, 获取 {len(research)} chars 参考信息")
+    else:
+        print(f"  ⚠️ 调研无结果，跳过")
+    return {"research_data": research, "messages": [HumanMessage(content=f"[Research] {len(research)} chars")]}
+
+
 def write_section(state: AgentState) -> dict:
     """NOT USED directly — sections are written via Send() in parallel_write."""
     raise NotImplementedError("Use parallel_write with Send() instead")
@@ -287,6 +332,13 @@ def parallel_write_section(section_title: str, topic: str, outline: str, researc
     prompt = f"""Write ONE section about "{topic}". Section: "{section_title}"
 
 300-500 words Markdown (H2 + sub-points). Stay on THIS section only. Include 1-2 code snippets if relevant."""
+
+    if research:
+        research_snippet = research[:800]
+        prompt += f"""
+
+Reference web search results (use for facts/data):
+{research_snippet}"""
 
     t0 = time.time()
     msg = llm.invoke([HumanMessage(content=prompt)])
@@ -329,6 +381,14 @@ def write_section(state: dict) -> dict:
     return {"article_sections": result}
 
 
+def join_sections(state: AgentState) -> dict:
+    """Barrier node: explicitly waits for all parallel write_section to complete.
+    Reports how many sections were written before passing to merge."""
+    sections = state.get("article_sections", {})
+    print(f"\n{'='*50}\n🔗 join: {len(sections)} 个章节全部写入完毕\n{'='*50}")
+    return {"messages": [HumanMessage(content=f"[Join] {len(sections)} sections complete")]}
+
+
 def merge_and_polish(state: AgentState) -> dict:
     """Reduce step: merge all sections and polish into final article."""
     sections = state.get("article_sections", {})
@@ -357,13 +417,35 @@ Sections:
         "article_attempts": state.get("article_attempts", 0) + 1,
     }
 
-def validate_blog(state: AgentState) -> dict:
-    """Fast check: article length > 1000 and not truncated mid-word."""
+def quality_evaluate(state: AgentState) -> dict:
+    """LLM quality evaluator: scores article on 4 dimensions.
+    Score < 8 → retry merge_and_polish (up to 3 attempts)."""
     article = state.get("article", "")
-    ok = len(article) > 1000 and not article.rstrip().endswith((" a", " th", " an", " wa", " ha"))
-    result = "OK" if ok else f"Retry: too short ({len(article)} chars)"
-    print(f"\n{'='*50}\n✅ 校验文章: {result}\n{'='*50}")
-    return {"messages": [HumanMessage(content=f"[Article check] {result}")]}
+    topic = state["topic"]
+    attempts = state.get("article_attempts", 0)
+    print(f"\n{'='*50}\n🏅 LLM 质量评估 (第{attempts}次)\n{'='*50}")
+    prompt = f"""Rate this article about "{topic}" on 4 dimensions (1-10 each):
+
+- factuality: are claims backed by data/examples?
+- structure: clear intro, body sections, conclusion?
+- seo: is the title compelling, keywords used naturally?
+- readability: fluent, scannable, engaging?
+
+Article (first 1500 chars):
+{article[:1500]}
+
+Return ONLY a JSON object, no other text:
+{{"factuality": N, "structure": N, "seo": N, "readability": N, "average": N}}"""
+    t0 = time.time()
+    msg = llm.invoke([HumanMessage(content=prompt)])
+    elapsed = time.time() - t0
+    content = msg.content.strip()
+
+    m = re.search(r'average[\s:]+(\d+(?:\.\d+)?)', content)
+    score = int(float(m.group(1))) if m else 5
+    print(f"  ⏱ 评估: {elapsed:.1f}s | score={score}/10 | {content[:120]}")
+    return {"quality_score": score}
+
 
 def finalize(state: AgentState) -> dict:
     """Generate 3 alternative titles & 2 tweet hooks from the finished article."""
@@ -425,20 +507,24 @@ def route_after_confirm(state: AgentState) -> str:
     print("  ↻ 未选择，重新请求")
     return "confirm_topic"
 
-def route_after_validate_outline(state: AgentState) -> Literal["plan_outline", "generate_section_tasks"]:
+def route_after_validate_outline(state: AgentState) -> Literal["plan_outline", "research_topic"]:
     last = state["messages"][-1].content if state.get("messages") else ""
     if "retry" in last.lower() and state.get("outline_attempts", 0) < 3:
         print("  ↻ 大纲不合格，重试...")
         return "plan_outline"
-    print("  → 大纲通过，进入并行写作")
-    return "generate_section_tasks"
+    print("  → 大纲通过，进入深度调研")
+    return "research_topic"
 
-def route_after_validate_blog(state: AgentState) -> str:
-    last = state["messages"][-1].content if state.get("messages") else ""
-    if "retry" in last.lower() and state.get("article_attempts", 0) < 3:
-        print("  ↻ 文章不合格，重新合并润色...")
+def route_after_quality_evaluate(state: AgentState) -> str:
+    score = state.get("quality_score", 0)
+    attempts = state.get("article_attempts", 0)
+    if score < 8 and attempts < 3:
+        print(f"  ↻ 质量分 {score}/10 < 8，第{attempts}次重试合并润色...")
         return "merge_and_polish"
-    print("  → 文章通过，进入最终润色")
+    if score < 8:
+        print(f"  ⚠ 已达最大重试次数 ({attempts})，接受当前质量")
+    else:
+        print(f"  → 质量分 {score}/10，通过")
     return "finalize"
 
 # ── 6. 构建图 ────────────────────────────────────────────────────────────────
@@ -450,15 +536,17 @@ builder.add_node("scan_sources", scan_sources)
 # Phase 2: Supervisor + HITL
 builder.add_node("supervisor_select", supervisor_select)
 builder.add_node("confirm_topic", confirm_topic)
-# Phase 3: Outline + Write
+# Phase 3: Outline + Research + Write
 builder.add_node("plan_outline", plan_outline)
 builder.add_node("validate_outline", validate_outline)
+builder.add_node("research_topic", research_topic)
 # Phase 3: Map-Reduce parallel writing
 builder.add_node("generate_section_tasks", generate_section_tasks)
 builder.add_node("write_section", write_section)
+builder.add_node("join_sections", join_sections)
 builder.add_node("merge_and_polish", merge_and_polish)
-# Phase 4: Validate + Finalize
-builder.add_node("validate_blog", validate_blog)
+# Phase 4: Quality evaluate + Finalize
+builder.add_node("quality_evaluate", quality_evaluate)
 builder.add_node("finalize", finalize)
 
 # ── Edges ──
@@ -470,12 +558,16 @@ builder.add_edge("confirm_topic", "plan_outline")
 builder.add_edge("plan_outline", "validate_outline")
 builder.add_conditional_edges("validate_outline", route_after_validate_outline)
 
+# research → Send() fan-out
+builder.add_edge("research_topic", "generate_section_tasks")
 # Send() fan-out: one task per H2 section (router function returns list[Send])
 builder.add_conditional_edges("generate_section_tasks", route_to_sections, ["write_section"])
-builder.add_edge("write_section", "merge_and_polish")
-# merge → validate → conditional retry or finalize
-builder.add_edge("merge_and_polish", "validate_blog")
-builder.add_conditional_edges("validate_blog", route_after_validate_blog)
+# Explicit join node: waits for all Send() branches
+builder.add_edge("write_section", "join_sections")
+builder.add_edge("join_sections", "merge_and_polish")
+# merge → quality eval → conditional retry or finalize
+builder.add_edge("merge_and_polish", "quality_evaluate")
+builder.add_conditional_edges("quality_evaluate", route_after_quality_evaluate)
 builder.add_edge("finalize", END)
 
 checkpointer = MemorySaver()
@@ -499,6 +591,7 @@ def run_pipeline(topic_hint: str = ""):
         "section_titles": [],
         "article": "",
         "article_attempts": 0,
+        "quality_score": 0,
         "seo_titles": [],
         "tweet_hooks": [],
         "human_feedback": "",

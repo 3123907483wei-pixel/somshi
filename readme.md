@@ -2,14 +2,17 @@
 
 基于 **LangGraph + MCP + DeepSeek** 的企业级自动化博客写作系统。
 
+[📐 架构设计文档 →](design.md)
+
 **解决痛点**: 热点捕捉慢 / 长文创作周期长 / 多源数据整合难
 
 **核心能力**:
 - 4 源热点扫描 (HackerNews / GitHub Trending / 微博 / 抖音)，**始终展示**趋势卡片
 - **双模式选题**：留空 = 趋势驱动 / 输入话题 = 话题驱动 (纯 LLM 知识，不关联趋势)
 - Human-in-the-Loop 人工审校确认
-- Map-Reduce 并行扩写 (Send() fan-out)
-- Checkpoint 断点恢复
+- Map-Reduce 并行扩写 (Send() + 显式 Join)
+- Runtime Checkpoint (MemorySaver, 进程级内存, 非持久化)
+- LLM quality evaluator (4 维度评分, <8 自动重试)
 - SEO 标题 + 推文钩子输出
 - **Web UI** 实时流式进度 + 趋势卡片 + 点击选题
 
@@ -19,38 +22,87 @@
 | 扫描 | `scan_sources` | ❌ | ~6s | — |
 | 选题 | `supervisor_select` | ✅ | ~10s | ~1200 in / 500 out |
 | 大纲 | `plan_outline` | ✅ | ~8s | ~300 in / 300 out |
+| 调研 | `research_topic` | ❌(MCP) | ~4s | — |
 | 并行写 | `write_section` × 3-4 | ✅ | ~15s | 4×300 in / 1800 out |
 | 合并 | `merge_and_polish` | ✅ | ~25s | ~2500 in / 1500 out |
+| 质评 | `quality_evaluate` | ✅ | ~5s | ~1500 in / 50 out |
 | 润色 | `finalize` | ✅ | ~5s | ~1200 in / 200 out |
-| **合计** | | | **~65s** | **~8K in / 4.3K out** |
+| **合计** | | | **~75s** | **~9.5K in / 4.3K out** |
 
 ---
 
-## 目录
-
+- [目录结构](#目录结构)
 - [核心工作流](#核心工作流)
-- [两个核心模块](#两个核心模块)
+- [五个核心模块](#五个核心模块)
 - [技术栈](#技术栈)
 - [快速开始](#快速开始)
+- [Docker 部署](#docker-部署)
 - [依赖清单](#依赖清单)
 - [演化历程](#演化历程)
 
 ---
 
-## 核心工作流
-
-v4 优化版：**11 个节点, 4 个阶段**，双模式选题。砍掉了 `research_deep`，validator 改为非 LLM 快检，趋势始终展示：
+## 目录结构
 
 ```
-Phase 1 ─ scan_sources ── ThreadPool 并行 4 源扫描 (始终执行)
-Phase 2 ─ supervisor_select ── 有 hint → 纯 LLM 知识选题 / 无 hint → 基于趋势选题
-       ─ [interrupt_before] ── HITL 选题确认
-Phase 3 ─ plan_outline ── 大纲 (3-4 节)
-       ─ validate_outline ── 快检 (非 LLM)
-       ─ Send() 并行写各节 (Map)
-       ─ merge_and_polish (Reduce)
-Phase 4 ─ validate_blog ── 快检 (非 LLM)
-       ─ finalize ── 标题 + 推文钩子 → END
+d:\somshi\
+├── app/                    # 应用核心
+│   ├── __init__.py
+│   ├── engine.py           # LangGraph 工作流 (12 节点 StateGraph)
+│   └── webui.py            # FastAPI Web 前端
+├── scanners/               # 热点扫描器
+│   ├── __init__.py
+│   ├── trends_scanner.py   # 4 源热点 (HN/GitHub/微博/抖音)
+│   └── crawlers.py         # 爬虫测试工具
+├── mcp/ → servers/       # MCP 服务器（改名避免与 pip 包冲突）
+│   ├── __init__.py
+│   └── search_server.py    # Bing Search MCP server
+├── notebooks/
+│   └── 1.ipynb             # 原型归档
+├── run.py                  # 命令行入口
+├── .env.example
+├── requirements.txt
+└── readme.md
+```
+
+
+
+## 核心工作流
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Phase 1: 多源热点并行扫描                                                │
+│  scan_sources ─── ThreadPool(HN, GitHub, 微博, 抖音) │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Phase 2: Supervisor 选题 + HITL                                       │
+│  supervisor_select ── 双模式: 无hint→趋势驱动 / 有hint→LLM知识          │
+│  confirm_topic ── interrupt_before 等待用户选择                          │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Phase 3: 大纲 → MCP 实时调研 → 并行写作 (Map → Join → Reduce)          │
+│  plan_outline ── LLM 生成 3-4 节大纲                                     │
+│  validate_outline ── 快检 H2≥2 → 不合格重试(×3)                          │
+│  research_topic ── MCP Bing Search 获取实时数据                          │
+│  Send() → write_section × N 并行 + 实时数据                               │
+│  join_sections ── 显式 Barrier (等所有分支结束)                           │
+│  merge_and_polish ── Reduce 合并润色                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Phase 4: LLM 质量评估 → 最终润色                                       │
+│  quality_evaluate ── 4 维度评分 (factuality/structure/SEO/readability)   │
+│                    ── score < 8 且重试<3 → 重回 merge_and_polish        │
+│  finalize ── 3×SEO标题 + 2×推文钩子                                      │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                            END
 ```
 
 | 模式 | 触发 | 趋势扫描 | 趋势展示 | Supervisor 选题源 |
@@ -65,9 +117,11 @@ Phase 4 ─ validate_blog ── 快检 (非 LLM)
 | `confirm_topic` | HITL 处理用户选择 | ❌ | 交互 |
 | `plan_outline` | 生成 3-4 节大纲 | ✅ | ~8s |
 | `validate_outline` | 非 LLM 快检 (H1/H2 计数) | ❌ | <1s |
-| `write_section` × 3-4 | Send() 并行各写 300-500 字 | ✅ | ~12s |
+| `research_topic` | MCP Bing Search 实时调研 | ❌ | ~4s |
+| `write_section` × 3-4 | Send() 并行各写 300-500 字 (含搜索参考) | ✅ | ~12s |
+| `join_sections` | 显式 Barrier，确认所有分支完成 | ❌ | <1s |
 | `merge_and_polish` | Reduce: 合并润色 | ✅ | ~20s |
-| `validate_blog` | 非 LLM 快检 (长度/截断) | ❌ | <1s |
+| `quality_evaluate` | LLM 4 维度评分 (factuality/structure/SEO/readability) | ✅ | ~5s |
 | `finalize` | 3 标题 + 2 推文钩子 | ✅ | ~6s |
 
 ### 关键 LangGraph 特性
@@ -75,18 +129,20 @@ Phase 4 ─ validate_blog ── 快检 (非 LLM)
 | 模式 | 实现 | 说明 |
 |------|------|------|
 | **Send() Map** | `scan_sources` + `write_section` | 并行多源扫描 + 按章节并行写作 |
+| **Join Barrier** | `join_sections` | 显式等待所有 Send() 分支结束再进入 Reduce |
 | **Reduce** | `merge_and_polish` | 合并各节成完整文章 |
 | **Supervisor** | `supervisor_select` | LLM 分析热点推荐选题 |
 | **Human-in-the-Loop** | `confirm_topic` + `interrupt_before` + `MemorySaver` | 用户选择话题, 可断点恢复 |
-| **Conditional Edge** | `validate_outline` / `validate_blog` | 校验失败自动重试 ×3 |
-| **Checkpoint** | `MemorySaver` | 中断点可恢复执行 |
+| **Conditional Edge** | `validate_outline` / `quality_evaluate` | 格式坍塌防御 + 质量重试环路 |
+| **LLM Evaluator** | `quality_evaluate` | 4 维度评分，score<8 自动重试 |
+| **Checkpoint** | `MemorySaver` | 进程级内存检查点，用于 HITL 中断恢复（非持久化） |
 | **状态剪枝** | `article_sections` 使用 `Annotated[dict, merge_dicts]` | 支持并行写入合并 |
 
 ---
 
-## 三个核心模块
+## 五个核心模块
 
-### 1. `agent2.py` — LangGraph 工作流引擎（核心）
+### 1. `app/engine.py` — LangGraph 工作流引擎（核心）
 
 **技术栈**：`langgraph` + `langchain-openai` + `langchain-core` + `mcp`
 
@@ -97,8 +153,11 @@ Phase 4 ─ validate_blog ── 快检 (非 LLM)
 - `Annotated[dict, merge_dicts]` reducer 支持并行写入状态合并
 - 条件边实现重试环路（格式坍塌防御）
 - Supervisor prompt 分支：有 topic_hint → 纯 LLM 知识 / 无 hint → 基于趋势
+- 显式 Join Barrier (`join_sections`) 等待所有 Send() 分支
+- LLM Quality Evaluator (`quality_evaluate`)：4 维度评分，<8 自动重试
+- `asyncio.new_event_loop()` 模式安全调用 MCP，避免 FastAPI 事件循环冲突
 
-### 2. `trends_scanner.py` — 多源热点扫描器
+### 2. `scanners/trends_scanner.py` — 多源热点扫描器
 
 **技术栈**：`requests` + `BeautifulSoup` + `ThreadPoolExecutor`
 
@@ -109,8 +168,9 @@ Phase 4 ─ validate_blog ── 快检 (非 LLM)
   - **抖音热搜** — 2 策略 (iesdouyin / aweme API)
 - 按源归一化热度 (200-1000) + 去重排序
 - 硬超时保护 (`ThreadPoolExecutor` + `as_completed(timeout=15s)`)
+- `requests.Session` 连接池复用，减少 TCP 握手开销
 
-### 3. `webui.py` — FastAPI Web 前端
+### 3. `app/webui.py` — FastAPI Web 前端
 
 **技术栈**：`FastAPI` + `uvicorn` + 原生 JS
 
@@ -121,17 +181,19 @@ Phase 4 ─ validate_blog ── 快检 (非 LLM)
 - 趋势始终可见，不因输入话题而隐藏
 - `/api/start` → `/api/status` → `/api/select` → done
 
-### 4. `crawlers.py` — 独立爬虫测试工具
+### 4. `scanners/crawlers.py` — 独立爬虫测试工具
 
-- 可单独运行 `python crawlers.py` 验证微博/抖音爬虫
+- 可单独运行 `python -m scanners.crawlers` 验证微博/抖音爬虫
 - 各 API 端点独立测试，输出成功率
 
-### 5. `server.py` — MCP Google Trends 服务器
+### 5. `servers/search_server.py` — MCP Bing Web Search 服务器
 
-**技术栈**：`pytrends` + MCP low-level API + Google ADK FunctionTool
+**技术栈**：Bing Search API v7 + MCP Stdio 协议（纯 MCP SDK，无 ADK）
 
-- MCP Stdio 协议暴露 `trends` 工具
-- 三级 Fallback: related_queries → trending_searches → realtime_trending
+- MCP Stdio 协议暴露 `web_search` 工具
+- 在 `research_topic` 节点中被调用，为主题和各章节标题搜索实时数据
+- 搜索结果注入 `write_section` prompt，解决 LLM 知识截止日期问题
+- 环境变量 `BING_SEARCH_API_KEY` 控制开关，缺失时优雅跳过
 
 ---
 
@@ -141,9 +203,9 @@ Phase 4 ─ validate_blog ── 快检 (非 LLM)
 |----|------|------|
 | 编排框架 | LangGraph (StateGraph) | DAG 工作流 + Send() + HITL + Checkpoint |
 | LLM | DeepSeek Chat (deepseek-chat) | 所有文本生成任务 |
-| MCP 客户端 | mcp Python SDK (stdio_client) | Agent ↔ server.py 进程间通信 |
-| MCP 服务器 | mcp low-level + ADK FunctionTool | 封装 pytrends 为工具 |
-| 数据源 | pytrends / requests / BS4 | Google Trends + 多源热点 |
+| MCP 客户端 | mcp Python SDK (stdio_client) | Agent ↔ MCP 服务器进程间通信 |
+| 数据源 | requests / BeautifulSoup | HN / GitHub / 微博 / 抖音 |
+| 实时搜索 | Bing Search API v7 (via MCP) | writing 阶段实时调研 |
 | 持久化 | langgraph.checkpoint.memory (MemorySaver) | HITL 断点恢复 |
 
 ---
@@ -174,13 +236,32 @@ DEEPSEEK_API_KEY=sk-your-key-here
 
 ```powershell
 # Web UI 模式 (推荐)
-python webui.py
+python -m app.webui
 # 浏览器打开 http://localhost:8000
 
 # 命令行模式
-python agent2.py "你的话题"
+python run.py "你的话题"
 # 或使用默认话题
-python agent2.py
+python run.py
+```
+
+---
+
+## Docker 部署
+
+```powershell
+# 1. 配置 API Key
+copy .env.example .env
+# 编辑 .env 填入 DEEPSEEK_API_KEY 和可选 BING_SEARCH_API_KEY
+
+# 2. 构建并启动
+docker compose up -d
+
+# 3. 打开浏览器
+# http://localhost:8000
+
+# 4. 查看日志
+docker compose logs -f
 ```
 
 ---
@@ -192,8 +273,6 @@ langgraph>=0.4.0
 langchain-openai>=0.3.0
 langchain-core>=0.3.0
 openai>=1.0.0
-pytrends>=4.9.0
-pandas>=1.0.0
 python-dotenv>=1.0.0
 mcp>=1.0.0
 fastapi>=0.100.0
@@ -212,7 +291,8 @@ lxml>=4.9.0
 | 原型 (1.ipynb) | Google ADK | Gemini Flash | 已归档 |
 | 初版 (agent.py) | Google ADK | Gemini Flash | 已删除 |
 | v2 (agent2.py) | LangGraph 线性 DAG | DeepSeek Chat | 已升级 |
-| **v3 (当前)** | LangGraph **多阶段 + Send() + HITL** | DeepSeek Chat | 已升级 |
-| **v4 (当前)** | **双模式选题 + 趋势常显 + 归一化热分 + Web UI** | **DeepSeek Chat** | **主力版本** |
+| v3 | LangGraph **多阶段 + Send() + HITL** | DeepSeek Chat | 已升级 |
+| v4| **双模式选题 + 趋势常显 + 归一化热分 + Web UI** | **DeepSeek Chat** | 已升级 |
+| **v5 (当前)** | **Join Barrier + LLM 质量评估 + MCP Bing 调研 + 移除 ADK** | **DeepSeek Chat** | **主力版本** |
 
-演化路径：线性 prompt → ADK 层级 Agent → LangGraph 线性 DAG → LangGraph 多阶段 Send/HITL → **v4 双模式 + Web UI**
+演化路径：线性 prompt → ADK 层级 Agent → LangGraph 线性 DAG → LangGraph 多阶段 Send/HITL → v4 双模式+Web UI → **v5 工程化打磨**
