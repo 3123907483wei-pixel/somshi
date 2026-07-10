@@ -4,7 +4,7 @@ __pycache__/
 *.pyo
 *.pyd
 
-# 忽略本地虚拟环境 (就是你之前配的虚拟环境文件夹)
+# 忽略本地虚拟环境
 .venv/
 venv/
 ENV/
@@ -17,3 +17,7 @@ ENV/
 .idea/
 .adk/
 /.adk/
+
+# 忽略测试日志
+result.log
+result2.log

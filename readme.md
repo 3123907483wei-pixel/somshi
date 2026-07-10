@@ -1,419 +1,218 @@
-# MCP Server Starter
+﻿# LangGraph 多 Agent 博客写作系统
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![MCP Spec](https://img.shields.io/badge/MCP-2025--03--26-purple.svg)](https://spec.modelcontextprotocol.io/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+基于 **LangGraph + MCP + DeepSeek** 的企业级自动化博客写作系统。
 
-一个轻量级、适合新手入门的 **MCP（Model Context Protocol）服务器** 示例项目。  
-本项目旨在帮助开发者快速理解 MCP 规范的核心概念，并实践如何构建可供大语言模型客户端（如 Claude Desktop）调用的 **Tools（工具）** 与 **Resources（资源）**。
+**解决痛点**: 热点捕捉慢 / 长文创作周期长 / 多源数据整合难
+
+**核心能力**:
+- 4 源热点扫描 (HackerNews / GitHub Trending / 微博 / 抖音)，**始终展示**趋势卡片
+- **双模式选题**：留空 = 趋势驱动 / 输入话题 = 话题驱动 (纯 LLM 知识，不关联趋势)
+- Human-in-the-Loop 人工审校确认
+- Map-Reduce 并行扩写 (Send() fan-out)
+- Checkpoint 断点恢复
+- SEO 标题 + 推文钩子输出
+- **Web UI** 实时流式进度 + 趋势卡片 + 点击选题
+
+**性能指标 (v4 实测)**:
+| 阶段 | 节点 | LLM | 耗时 | Token |
+|------|------|-----|------|-------|
+| 扫描 | `scan_sources` | ❌ | ~6s | — |
+| 选题 | `supervisor_select` | ✅ | ~10s | ~1200 in / 500 out |
+| 大纲 | `plan_outline` | ✅ | ~8s | ~300 in / 300 out |
+| 并行写 | `write_section` × 3-4 | ✅ | ~15s | 4×300 in / 1800 out |
+| 合并 | `merge_and_polish` | ✅ | ~25s | ~2500 in / 1500 out |
+| 润色 | `finalize` | ✅ | ~5s | ~1200 in / 200 out |
+| **合计** | | | **~65s** | **~8K in / 4.3K out** |
 
 ---
 
 ## 目录
 
-- [MCP 通信原理](#mcp-通信原理)
-- [功能特性](#功能特性)
-- [项目结构](#项目结构)
-- [前置条件](#前置条件)
+- [核心工作流](#核心工作流)
+- [两个核心模块](#两个核心模块)
+- [技术栈](#技术栈)
 - [快速开始](#快速开始)
-- [客户端配置集成](#客户端配置集成)
-- [开发调试](#开发调试)
-- [开发与扩展](#开发与扩展)
-- [许可证](#许可证)
+- [依赖清单](#依赖清单)
+- [演化历程](#演化历程)
 
 ---
 
-## MCP 通信原理
+## 核心工作流
 
-> ⚠️ **重要：理解这一点才能正确使用 MCP 服务器。**
-
-MCP 服务器**不**是一个可以被直接 `python server.py` 启动并看到输出画面的 Web 服务。它的核心通信机制是 **Stdio（Standard Input / Output，标准输入输出）**：
+v4 优化版：**11 个节点, 4 个阶段**，双模式选题。砍掉了 `research_deep`，validator 改为非 LLM 快检，趋势始终展示：
 
 ```
-┌──────────────────────┐          JSON-RPC 消息         ┌──────────────────────┐
-│   LLM 客户端          │  ────── (通过 stdin/stdout) ──→  │  MCP 服务器          │
-│  (Claude Desktop 等)  │  ←───────────────────────────  │  (你的 server.py)     │
-└──────────────────────┘                                 └──────────────────────┘
+Phase 1 ─ scan_sources ── ThreadPool 并行 4 源扫描 (始终执行)
+Phase 2 ─ supervisor_select ── 有 hint → 纯 LLM 知识选题 / 无 hint → 基于趋势选题
+       ─ [interrupt_before] ── HITL 选题确认
+Phase 3 ─ plan_outline ── 大纲 (3-4 节)
+       ─ validate_outline ── 快检 (非 LLM)
+       ─ Send() 并行写各节 (Map)
+       ─ merge_and_polish (Reduce)
+Phase 4 ─ validate_blog ── 快检 (非 LLM)
+       ─ finalize ── 标题 + 推文钩子 → END
 ```
 
-- 客户端通过 **标准输入（stdin）** 向服务器发送 JSON-RPC 格式的请求
-- 服务器通过 **标准输出（stdout）** 返回 JSON-RPC 格式的响应
-- **标准错误（stderr）** 保留给日志输出，方便开发者调试
-- 直接在终端运行 `python server.py` 不会有任何可见输出——因为程序只是在等待 stdin 输入，你看到的只是"挂起"状态，**这不是正确用法**
+| 模式 | 触发 | 趋势扫描 | 趋势展示 | Supervisor 选题源 |
+|------|------|----------|----------|-------------------|
+| 🟢 趋势驱动 | 输入框留空 | ✅ 4源扫描 | ✅ | 趋势数据 |
+| 🟡 话题驱动 | 输入话题 | ✅ 4源扫描 | ✅ | 纯 LLM 知识 |
 
-> 💡 **正确用法**：MCP 服务器必须由 MCP 客户端（Claude Desktop、VS Code 等）**作为子进程启动**，通过 Stdio 管道进行通信。详见下方的[客户端配置集成](#客户端配置集成)与[开发调试](#开发调试)章节。
+| 节点 | 功能 | 调用 LLM | 耗时估算 |
+|------|------|----------|----------|
+| `scan_sources` | ThreadPool 并行扫 4 源 (始终执行) | ❌ | ~8s |
+| `supervisor_select` | 有hint→LLM知识选题 / 无hint→趋势选题 | ✅ | ~10s |
+| `confirm_topic` | HITL 处理用户选择 | ❌ | 交互 |
+| `plan_outline` | 生成 3-4 节大纲 | ✅ | ~8s |
+| `validate_outline` | 非 LLM 快检 (H1/H2 计数) | ❌ | <1s |
+| `write_section` × 3-4 | Send() 并行各写 300-500 字 | ✅ | ~12s |
+| `merge_and_polish` | Reduce: 合并润色 | ✅ | ~20s |
+| `validate_blog` | 非 LLM 快检 (长度/截断) | ❌ | <1s |
+| `finalize` | 3 标题 + 2 推文钩子 | ✅ | ~6s |
+
+### 关键 LangGraph 特性
+
+| 模式 | 实现 | 说明 |
+|------|------|------|
+| **Send() Map** | `scan_sources` + `write_section` | 并行多源扫描 + 按章节并行写作 |
+| **Reduce** | `merge_and_polish` | 合并各节成完整文章 |
+| **Supervisor** | `supervisor_select` | LLM 分析热点推荐选题 |
+| **Human-in-the-Loop** | `confirm_topic` + `interrupt_before` + `MemorySaver` | 用户选择话题, 可断点恢复 |
+| **Conditional Edge** | `validate_outline` / `validate_blog` | 校验失败自动重试 ×3 |
+| **Checkpoint** | `MemorySaver` | 中断点可恢复执行 |
+| **状态剪枝** | `article_sections` 使用 `Annotated[dict, merge_dicts]` | 支持并行写入合并 |
 
 ---
 
-## 功能特性
+## 三个核心模块
 
-本 MCP 服务器目前提供以下能力：
+### 1. `agent2.py` — LangGraph 工作流引擎（核心）
 
-### 🛠️ Tools（工具）
+**技术栈**：`langgraph` + `langchain-openai` + `langchain-core` + `mcp`
 
-| 工具名称 | 描述 | 输入参数 |
-|---------|------|---------|
-| `get_local_time` | 获取指定时区的当前日期与时间 | `timezone`（可选，默认 `Asia/Shanghai`） |
-| `get_weather` | 查询指定城市的实时天气信息 | `city`（必填，城市名称） |
-| `read_local_file` | 读取本地指定路径的文件内容 | `file_path`（必填，文件绝对路径） |
+- 11 个节点的 StateGraph, 覆盖 Map-Reduce / Supervisor / HITL
+- `Send()` API 实现并行 fan-out（多源扫描 + 按节写作）
+- `interrupt_before` + `Command(resume=...)` 实现 HITL
+- `MemorySaver` checkpointer 支持断点恢复
+- `Annotated[dict, merge_dicts]` reducer 支持并行写入状态合并
+- 条件边实现重试环路（格式坍塌防御）
+- Supervisor prompt 分支：有 topic_hint → 纯 LLM 知识 / 无 hint → 基于趋势
 
-### 📂 Resources（资源）
+### 2. `trends_scanner.py` — 多源热点扫描器
 
-| 资源 URI | 描述 |
-|----------|------|
-| `file:///logs/app.log` | 暴露本地应用日志文件内容，供客户端按需读取 |
-| `config://server/settings` | 展示服务器当前运行的配置信息（JSON 格式） |
+**技术栈**：`requests` + `BeautifulSoup` + `ThreadPoolExecutor`
 
-> 💡 **提示：** 以上均为示例功能，你可以在此基础上自由扩展。
+- 4 个热点源并行扫描：
+  - **Hacker News** — Firebase API (top 5-6 stories)
+  - **GitHub Trending** — Web scraping 热门仓库
+  - **微博热搜** — 3 策略 fallback (mobile API / hot_band / side panel)
+  - **抖音热搜** — 2 策略 (iesdouyin / aweme API)
+- 按源归一化热度 (200-1000) + 去重排序
+- 硬超时保护 (`ThreadPoolExecutor` + `as_completed(timeout=15s)`)
+
+### 3. `webui.py` — FastAPI Web 前端
+
+**技术栈**：`FastAPI` + `uvicorn` + 原生 JS
+
+- 输入话题偏好文本框（留空=趋势驱动，填入=话题驱动）
+- 趋势卡片实时展示 (4 源颜色标签：HN🟠 GH⚫ WB🔴 DY⚫)
+- 实时轮询进度 (流式显示每个节点状态)
+- HITL 点击选题 → 文章流式展示
+- 趋势始终可见，不因输入话题而隐藏
+- `/api/start` → `/api/status` → `/api/select` → done
+
+### 4. `crawlers.py` — 独立爬虫测试工具
+
+- 可单独运行 `python crawlers.py` 验证微博/抖音爬虫
+- 各 API 端点独立测试，输出成功率
+
+### 5. `server.py` — MCP Google Trends 服务器
+
+**技术栈**：`pytrends` + MCP low-level API + Google ADK FunctionTool
+
+- MCP Stdio 协议暴露 `trends` 工具
+- 三级 Fallback: related_queries → trending_searches → realtime_trending
 
 ---
 
-## 项目结构
+## 技术栈
 
-```
-mcp-server-starter/
-├── server.py              # MCP 服务器入口，注册 Tools 和 Resources
-├── requirements.txt       # Python 依赖清单
-├── .env.example           # 环境变量模板
-├── README.md              # 本文件
-└── LICENSE                # MIT 许可证
-```
-
----
-
-## 前置条件
-
-在开始之前，请确保你的开发环境中已安装以下工具：
-
-- **Python 3.10+** — 可在终端用 `python --version` 确认版本
-- **pip** — Python 包管理器（通常随 Python 一同安装）
-- **uv（强烈推荐）** — 快速的 Python 包管理工具，安装方式：
-
-  ```powershell
-  # PowerShell（Windows）
-  powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-  ```
-
-  > 如果不想安装 uv，也可以使用标准 pip，但后续的 `uvx` 配置方式将不可用。
-
-- **Node.js 18+（调试用）** — 用于运行 MCP Inspector 调试工具，从 [nodejs.org](https://nodejs.org/) 下载安装
+| 层 | 技术 | 用途 |
+|----|------|------|
+| 编排框架 | LangGraph (StateGraph) | DAG 工作流 + Send() + HITL + Checkpoint |
+| LLM | DeepSeek Chat (deepseek-chat) | 所有文本生成任务 |
+| MCP 客户端 | mcp Python SDK (stdio_client) | Agent ↔ server.py 进程间通信 |
+| MCP 服务器 | mcp low-level + ADK FunctionTool | 封装 pytrends 为工具 |
+| 数据源 | pytrends / requests / BS4 | Google Trends + 多源热点 |
+| 持久化 | langgraph.checkpoint.memory (MemorySaver) | HITL 断点恢复 |
 
 ---
 
 ## 快速开始
 
-### 1. 克隆项目
-
-```bash
-git clone https://github.com/yourusername/mcp-server-starter.git
-cd mcp-server-starter
-```
-
-### 2. 创建虚拟环境并安装依赖
+### 1. 创建虚拟环境并安装依赖
 
 ```powershell
-# 创建虚拟环境
 python -m venv .venv
-
-# 激活虚拟环境（Windows）
 .venv\Scripts\activate
-
-# macOS / Linux:
-# source .venv/bin/activate
-
-# 安装依赖
 pip install -r requirements.txt
 ```
 
-### 3. 配置环境变量（可选）
-
-将 `.env.example` 复制为 `.env`，并按需填入配置：
+### 2. 配置环境变量
 
 ```powershell
 copy .env.example .env
 ```
 
-查看 `.env.example` 内容：
+在 .env 中填入 DeepSeek API Key：
 
-```
-# .env.example
-WEATHER_API_KEY=your_api_key_here
-LOG_FILE_PATH=/var/log/myapp/app.log
+```ini
+DEEPSEEK_API_KEY=sk-your-key-here
 ```
 
-> 如果不需要天气 API，可以跳过此步骤，`get_weather` 将返回模拟数据。
-
-### ✅ 如何验证服务器能正常工作？
-
-安装完成后，**不要直接运行 `python server.py`**。请使用以下任意一种方式验证：
-
-#### 方式 A：使用 MCP Inspector（浏览器调试界面，推荐）
+### 3. 运行
 
 ```powershell
-npx @modelcontextprotocol/inspector python server.py
-```
+# Web UI 模式 (推荐)
+python webui.py
+# 浏览器打开 http://localhost:8000
 
-这将启动一个本地 Web 调试界面（通常访问 `http://localhost:5173`），你可以在浏览器中直观地测试所有 Tools 和 Resources。
-
-#### 方式 B：编写简易测试脚本
-
-创建一个 `test_server.py`：
-
-```python
-import subprocess
-import json
-
-# 启动 MCP 服务器子进程
-proc = subprocess.Popen(
-    ["python", "server.py"],
-    stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    text=True
-)
-
-# 发送初始化请求
-request = json.dumps({
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "tools/list",
-    "params": {}
-})
-
-stdout, stderr = proc.communicate(input=request + "\n")
-print("服务器响应:", stdout)
+# 命令行模式
+python agent2.py "你的话题"
+# 或使用默认话题
+python agent2.py
 ```
 
 ---
 
-## 客户端配置集成
+## 依赖清单
 
-要将此 MCP 服务器接入大模型客户端（如 Claude Desktop），请编辑客户端的配置文件。
-
-### Claude Desktop 配置
-
-编辑 `claude_desktop_config.json`：
-
-- **Windows 路径：** `%APPDATA%\Claude\claude_desktop_config.json`
-- **macOS 路径：** `~/.config/Claude/claude_desktop_config.json`
-
-#### 方式一：通过 UVX 运行（推荐）
-
-> ⚠️ 前提：已安装 [uv](https://docs.astral.sh/uv/)。uvx 会自动创建隔离环境，无需手动管理 venv。
-
-```json
-{
-  "mcpServers": {
-    "mcp-server-starter": {
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/yourusername/mcp-server-starter",
-        "python",
-        "server.py"
-      ]
-    }
-  }
-}
-```
-
-如果你的代码在**本地目录**：
-
-```json
-{
-  "mcpServers": {
-    "mcp-server-starter": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "C:/Users/你的用户名/projects/mcp-server-starter",
-        "server.py"
-      ]
-    }
-  }
-}
-```
-
-#### 方式二：指定虚拟环境的 Python 解释器（最稳妥）
-
-```json
-{
-  "mcpServers": {
-    "mcp-server-starter": {
-      "command": "C:\\Users\\你的用户名\\projects\\mcp-server-starter\\.venv\\Scripts\\python.exe",
-      "args": [
-        "C:\\Users\\你的用户名\\projects\\mcp-server-starter\\server.py"
-      ]
-    }
-  }
-}
-```
-
-> ⚠️ **Windows 路径注意事项：**
-> - JSON 字符串中的反斜杠必须转义，请使用双反斜杠 `\\` 或正斜杠 `/`
-> - ✅ 正确：`"C:\\Users\\Alice\\project\\server.py"`
-> - ✅ 正确：`"C:/Users/Alice/project/server.py"`
-> - ❌ 错误：`"C:\Users\Alice\project\server.py"`
-
-### 验证集成
-
-配置完成后，**重启 Claude Desktop**。在对话界面中你应该能够看到 Tools 图标出现，尝试提问：
-
-- _"现在北京时间是多少？"_
-- _"上海今天天气怎么样？"_
-- _"帮我读一下本地的日志文件"_
-
-如果 Claude Desktop 右侧没有出现工具图标，请检查：
-1. `claude_desktop_config.json` 的 JSON 格式是否正确（可用 [JSONLint](https://jsonlint.com/) 校验）
-2. 路径中的 `python.exe` 是否存在
-3. 查看 Claude Desktop 日志（`%APPDATA%\Claude\logs\`）排查错误
-
----
-
-## 开发调试
-
-### 使用 MCP Inspector（官方调试工具）
-
-Anthropic 官方提供了 `@modelcontextprotocol/inspector`，它在浏览器中提供了一个图形化界面，让你可以无需客户端即可调试 MCP 服务器：
-
-```powershell
-npx @modelcontextprotocol/inspector python server.py
-```
-
-启动后：
-
-1. 终端会显示 `WebSocket server started at ws://localhost:5173` 等日志
-2. 浏览器自动打开 `http://localhost:5173`
-3. 在 Inspector 界面中，你可以：
-   - **列出所有已注册的 Tools 和 Resources**
-   - **手动调用任意 Tool** 并实时查看返回结果
-   - **读取任意 Resource** 的内容
-   - **查看 JSON-RPC 原始请求与响应**，便于深入理解协议细节
-
-### 日志调试技巧
-
-在 `server.py` 中，所有通过 `print(..., file=sys.stderr)` 或 `logging` 模块输出的内容都会被发送到 **stderr**，不会干扰 Stdio 通信：
-
-```python
-import sys
-
-# 调试日志输出到 stderr（安全，不影响 MCP 协议通信）
-print("get_local_time 被调用了", file=sys.stderr, flush=True)
-```
-
-这些日志在 Inspector 的控制台或客户端的日志文件中可见。
-
----
-
-## 开发与扩展
-
-### 添加一个新的 Tool
-
-在 `server.py` 中，使用 `@server.tool()` 装饰器注册一个新函数。以下是两个实用示例：
-
-#### 示例 1：数学计算工具
-
-```python
-from mcp.server import Server
-
-server = Server("mcp-server-starter")
-
-@server.tool()
-async def calculate(expression: str) -> str:
-    """计算数学表达式并返回结果"""
-    try:
-        # 注意：生产环境应使用 safer 的解析方式
-        result = eval(expression, {"__builtins__": {}}, {})
-        return f"计算结果：{result}"
-    except Exception as e:
-        return f"计算错误：{str(e)}"
-```
-
-#### 示例 2：读取工作目录文件列表（Windows 友好）
-
-这个工具展示了如何处理 Windows 路径编码问题：
-
-```python
-import os
-import sys
-from pathlib import Path
-
-@server.tool()
-async def list_workspace_files(directory: str = ".") -> str:
-    """
-    列出指定目录下的所有文件及其基本信息。
-    适用于 Windows / macOS / Linux 跨平台场景。
-    """
-    try:
-        # 使用 pathlib 处理 Windows 路径编码
-        target = Path(directory).resolve()
-
-        if not target.exists():
-            return f"错误：路径不存在 - {target}"
-
-        if not target.is_dir():
-            return f"错误：路径不是目录 - {target}"
-
-        files = []
-        for entry in target.iterdir():
-            info = {
-                "name": entry.name,
-                "type": "目录" if entry.is_dir() else "文件",
-                "size": entry.stat().st_size if entry.is_file() else 0,
-            }
-            files.append(info)
-
-        # 按类型排序：目录在前，文件在后
-        files.sort(key=lambda x: (x["type"], x["name"]))
-
-        lines = [f"📁 {target} 中的内容：", "─" * 40]
-        for f in files:
-            icon = "📁" if f["type"] == "目录" else "📄"
-            size_str = f" ({f['size']} bytes)" if f["size"] > 0 else ""
-            lines.append(f"  {icon} {f['name']}{size_str}")
-        lines.append(f"─" * 40)
-        lines.append(f"共 {len(files)} 项")
-
-        return "\n".join(lines)
-    except Exception as e:
-        return f"读取目录时出错：{str(e)}"
-```
-
-#### 核心要点
-
-1. 使用 `@server.tool()` 装饰器将函数注册为 Tool
-2. 函数签名中的**类型注解**（`str`, `int`, `bool` 等）会自动映射为工具的输入参数 schema
-3. 函数的 **docstring** 会成为该工具的描述信息，供大模型理解使用场景
-4. 函数应为 `async` 异步函数以支持并发调用
-5. Windows 环境下务必使用 `pathlib.Path` 处理路径，避免编码问题
-
-### 添加一个新的 Resource
-
-```python
-@server.resource("config://server/version")
-async def get_server_version() -> str:
-    """返回当前服务器版本信息"""
-    return json.dumps({"version": "1.0.0", "build": "2026-07-01"})
+```txt
+langgraph>=0.4.0
+langchain-openai>=0.3.0
+langchain-core>=0.3.0
+openai>=1.0.0
+pytrends>=4.9.0
+pandas>=1.0.0
+python-dotenv>=1.0.0
+mcp>=1.0.0
+fastapi>=0.100.0
+uvicorn>=0.20.0
+requests>=2.28.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
 ```
 
 ---
 
-## 许可证
+## 演化历程
 
-本项目基于 **MIT 许可证** 开源 — 详见 [LICENSE](LICENSE) 文件。
+| 阶段 | 框架 | 模型 | 状态 |
+|------|------|------|------|
+| 原型 (1.ipynb) | Google ADK | Gemini Flash | 已归档 |
+| 初版 (agent.py) | Google ADK | Gemini Flash | 已删除 |
+| v2 (agent2.py) | LangGraph 线性 DAG | DeepSeek Chat | 已升级 |
+| **v3 (当前)** | LangGraph **多阶段 + Send() + HITL** | DeepSeek Chat | 已升级 |
+| **v4 (当前)** | **双模式选题 + 趋势常显 + 归一化热分 + Web UI** | **DeepSeek Chat** | **主力版本** |
 
-```
-MIT License
-
-Copyright (c) 2026 yourname
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files...
-```
-
----
-
-<p align="center">
-  用 ❤️ 构建 · 仅供学习 MCP 规范之用
-</p>
+演化路径：线性 prompt → ADK 层级 Agent → LangGraph 线性 DAG → LangGraph 多阶段 Send/HITL → **v4 双模式 + Web UI**
