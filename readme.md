@@ -56,7 +56,7 @@ d:\somshi\
 │   └── crawlers.py         # 爬虫测试工具
 ├── mcp/ → servers/       # MCP 服务器（改名避免与 pip 包冲突）
 │   ├── __init__.py
-│   └── search_server.py    # Bing Search MCP server
+│   └── search_server.py    # DuckDuckGo Search MCP server
 ├── notebooks/
 │   └── 1.ipynb             # 原型归档
 ├── run.py                  # 命令行入口
@@ -87,7 +87,7 @@ d:\somshi\
 │  Phase 3: 大纲 → MCP 实时调研 → 并行写作 (Map → Join → Reduce)          │
 │  plan_outline ── LLM 生成 3-4 节大纲                                     │
 │  validate_outline ── 快检 H2≥2 → 不合格重试(×3)                          │
-│  research_topic ── MCP Bing Search 获取实时数据                          │
+│  research_topic ── MCP DuckDuckGo Search 获取实时数据                         │
 │  Send() → write_section × N 并行 + 实时数据                               │
 │  join_sections ── 显式 Barrier (等所有分支结束)                           │
 │  merge_and_polish ── Reduce 合并润色                                     │
@@ -117,7 +117,7 @@ d:\somshi\
 | `confirm_topic` | HITL 处理用户选择 | ❌ | 交互 |
 | `plan_outline` | 生成 3-4 节大纲 | ✅ | ~8s |
 | `validate_outline` | 非 LLM 快检 (H1/H2 计数) | ❌ | <1s |
-| `research_topic` | MCP Bing Search 实时调研 | ❌ | ~4s |
+| `research_topic` | MCP DuckDuckGo Search 实时调研 | ❌ | ~4s |
 | `write_section` × 3-4 | Send() 并行各写 300-500 字 (含搜索参考) | ✅ | ~12s |
 | `join_sections` | 显式 Barrier，确认所有分支完成 | ❌ | <1s |
 | `merge_and_polish` | Reduce: 合并润色 | ✅ | ~20s |
@@ -186,14 +186,14 @@ d:\somshi\
 - 可单独运行 `python -m scanners.crawlers` 验证微博/抖音爬虫
 - 各 API 端点独立测试，输出成功率
 
-### 5. `servers/search_server.py` — MCP Bing Web Search 服务器
+### 5. `servers/search_server.py` — MCP DuckDuckGo Web Search 服务器
 
-**技术栈**：Bing Search API v7 + MCP Stdio 协议（纯 MCP SDK，无 ADK）
+**技术栈**：DuckDuckGo + MCP Stdio 协议（纯 MCP SDK，无 ADK，**无需 API Key**）
 
 - MCP Stdio 协议暴露 `web_search` 工具
 - 在 `research_topic` 节点中被调用，为主题和各章节标题搜索实时数据
 - 搜索结果注入 `write_section` prompt，解决 LLM 知识截止日期问题
-- 环境变量 `BING_SEARCH_API_KEY` 控制开关，缺失时优雅跳过
+- DuckDuckGo 完全免费，无需任何 API Key
 
 ---
 
@@ -205,7 +205,7 @@ d:\somshi\
 | LLM | DeepSeek Chat (deepseek-chat) | 所有文本生成任务 |
 | MCP 客户端 | mcp Python SDK (stdio_client) | Agent ↔ MCP 服务器进程间通信 |
 | 数据源 | requests / BeautifulSoup | HN / GitHub / 微博 / 抖音 |
-| 实时搜索 | Bing Search API v7 (via MCP) | writing 阶段实时调研 |
+| 实时搜索 | DuckDuckGo (via MCP) | writing 阶段实时调研，无需 API Key |
 | 持久化 | langgraph.checkpoint.memory (MemorySaver) | HITL 断点恢复 |
 
 ---
@@ -252,7 +252,7 @@ python run.py
 ```powershell
 # 1. 配置 API Key
 copy .env.example .env
-# 编辑 .env 填入 DEEPSEEK_API_KEY 和可选 BING_SEARCH_API_KEY
+# 编辑 .env 填入 DEEPSEEK_API_KEY
 
 # 2. 构建并启动
 docker compose up -d
@@ -293,6 +293,6 @@ lxml>=4.9.0
 | v2 (agent2.py) | LangGraph 线性 DAG | DeepSeek Chat | 已升级 |
 | v3 | LangGraph **多阶段 + Send() + HITL** | DeepSeek Chat | 已升级 |
 | v4| **双模式选题 + 趋势常显 + 归一化热分 + Web UI** | **DeepSeek Chat** | 已升级 |
-| **v5 (当前)** | **Join Barrier + LLM 质量评估 + MCP Bing 调研 + 移除 ADK** | **DeepSeek Chat** | **主力版本** |
+| **v5 (当前)** | **Join Barrier + LLM 质量评估 + MCP DuckDuckGo 调研 + 移除 ADK** | **DeepSeek Chat** | **主力版本** |
 
 演化路径：线性 prompt → ADK 层级 Agent → LangGraph 线性 DAG → LangGraph 多阶段 Send/HITL → v4 双模式+Web UI → **v5 工程化打磨**

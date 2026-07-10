@@ -7,7 +7,7 @@ A LangGraph-based multi-agent blog writing system designed for content marketing
 **Key Metrics**:
 - End-to-end latency: ~75s (12-node DAG)
 - Token cost: ~9.5K in / 4.3K out per article
-- Sources: 4 trend feeds + Bing Search API
+- Sources: 4 trend feeds + DuckDuckGo Search
 - Output: 3000-5000 word Markdown article
 
 ---
@@ -27,7 +27,7 @@ graph TB
         S3[confirm_topic<br/>Human-in-the-Loop]
         S4[plan_outline<br/>LLM outline generation]
         S5[validate_outline<br/>Regex/H2 count check]
-        S6[research_topic<br/>MCP Bing Search]
+        S6[research_topic<br/>MCP DuckDuckGo Search]
         S7[write_section × N<br/>Send() parallel writing]
         S8[join_sections<br/>Barrier node]
         S9[merge_and_polish<br/>Reduce]
@@ -48,7 +48,7 @@ graph TB
     end
 
     subgraph MCP["MCP Servers"]
-        BS[search_server.py<br/>Bing Web Search v7]
+        BS[search_server.py<br/>DuckDuckGo Search]
     end
 
     subgraph LLM["LLM Backend"]
@@ -87,7 +87,7 @@ graph LR
     end
 
     subgraph MCPDir["servers/"]
-        search[search_server.py<br/>Bing Search MCP server<br/>Stdio protocol]
+        search[search_server.py<br/>DuckDuckGo Search<br/>Stdio protocol]
     end
 
     subgraph Infra["Infrastructure"]
@@ -135,7 +135,7 @@ sequenceDiagram
     
     par Research per section
         Engine->>MCP: web_search(topic + section titles)
-        MCP-->>Engine: Bing search results
+        MCP-->>Engine: DuckDuckGo search results
     end
     
     par Write sections in parallel (Send)
@@ -173,7 +173,7 @@ sequenceDiagram
 - Conditional edges enable retry loops for quality control
 
 ### 2. MCP (Model Context Protocol) for Tool Integration
-- Standardized protocol between agent and external tools (Bing Search)
+- Standardized protocol between agent and external tools (DuckDuckGo Search)
 - Each MCP server runs as a separate subprocess, providing isolation
 - stdio transport is lightweight — no HTTP server needed for tool communication
 - Easy to add new tools: create a new MCP server + register as LangChain tool
@@ -230,7 +230,7 @@ d:\somshi\
 │   └── crawlers.py         # Standalone crawler test tool
 ├── servers/
 │   ├── __init__.py
-│   └── search_server.py    # Bing Search MCP server
+│   └── search_server.py    # DuckDuckGo Search server
 ├── run.py                  # CLI entry point
 ├── Dockerfile              # Container build
 ├── docker-compose.yml      # Container orchestration
@@ -245,7 +245,8 @@ d:\somshi\
 ```powershell
 # 1. Configure API keys
 copy .env.example .env
-# Edit .env with your DEEPSEEK_API_KEY and BING_SEARCH_API_KEY
+# Edit .env with your DEEPSEEK_API_KEY only
+# DuckDuckGo search is free, no API key needed
 
 # 2. Build and run
 docker compose up -d
