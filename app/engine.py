@@ -390,62 +390,97 @@ def join_sections(state: AgentState) -> dict:
 
 
 def merge_and_polish(state: AgentState) -> dict:
-    """Reduce step: merge all sections and polish into final article."""
+    """Reduce step: merge all sections and polish into final article.
+    Dynamically injects review feedback from quality_evaluate to form a correction loop."""
     sections = state.get("article_sections", {})
     topic = state["topic"]
-    print(f"\n{'='*50}\n🧩 合并 {len(sections)} 个章节\n{'='*50}")
+    
+    # 1. 捞取上一轮质检节点留下的改进意见
+    feedback = state.get("review_feedback", "")
+    attempts = state.get("article_attempts", 0) + 1 # 当前是第几次尝试写/改稿
 
+    print(f"\n{'='*50}\n🧩 合并润色: {len(sections)} 个章节 (第 {attempts} 次尝试)\n{'='*50}")
+
+    # 2. 拼接完整章节内容
     merged = f"# {topic}\n\n"
     for sec_title, content in sections.items():
         merged += f"\n{content}\n\n"
 
+    # 3. 构建高压力的 Prompt 框架
     prompt = f"""Merge these sections into a cohesive article about "{topic}".
 Add an intro and conclusion if missing. Fix transitions between sections.
 Keep Markdown formatting. Don't introduce new facts.
 
-Sections:
-{merged[:2500]}"""
+"""
+    # 4. 精准打击：如果存在历史退稿意见，强行打补丁指导模型修改
+    if feedback:
+        prompt += f"""⚠️⚠️⚠️ [CRITICAL] 上一轮评估未通过，请务必根据以下评审意见进行定向优化与大修：
+{feedback}
+=======================================================================\n\n"""
+
+    # 5. ⚠️ 安全隐患修复：移除 [:2500] 限制，向大模型塞入完整的合并文本
+    prompt += f"Sections:\n{merged}"
+
     t0 = time.time()
+    # 6. 干净呼叫，不乱加多余的 HumanMessage 塞进历史
     msg = llm.invoke([HumanMessage(content=prompt)])
     elapsed = time.time() - t0
-    print(f"  ⏱ merge: {elapsed:.1f}s | {len(prompt)}→{len(msg.content)} chars")
+    
     article = msg.content.strip()
-    print(f"  📄 合并完成 ({len(article)} chars)")
+    print(f" ⏱ merge: {elapsed:.1f}s | {len(prompt)}→{len(article)} chars")
+    print(f" 📄 合并完成 ({len(article)} chars)")
 
+    # 7. 写入全局状态，顺便把反馈清空（防止下下次重试时读到过期的旧反馈）
     return {
         "article": article,
-        "article_attempts": state.get("article_attempts", 0) + 1,
+        "article_attempts": attempts,
+        "review_feedback": ""  # 消费完当前反馈后清空它，等待新一轮 quality_evaluate 生成新反馈
     }
 
+from pydantic import BaseModel, Field
+from langchain_core.utils.function_calling import convert_to_openai_function
+
+# 1. 定义严格的 Pydantic 质检结构
+class QualityReport(BaseModel):
+    factuality: int = Field(description="事实准确性评分 1-10")
+    structure: int = Field(description="结构完整性评分 1-10")
+    seo: int = Field(description="SEO与标题评分 1-10")
+    readability: int = Field(description="可读性评分 1-10")
+    average: float = Field(description="四项评分的平均分")
+    feedback: str = Field(description="具体的修改意见，指出哪里需要扩写、删减或润色")
+
 def quality_evaluate(state: AgentState) -> dict:
-    """LLM quality evaluator: scores article on 4 dimensions.
-    Score < 8 → retry merge_and_polish (up to 3 attempts)."""
     article = state.get("article", "")
     topic = state["topic"]
     attempts = state.get("article_attempts", 0)
-    print(f"\n{'='*50}\n🏅 LLM 质量评估 (第{attempts}次)\n{'='*50}")
-    prompt = f"""Rate this article about "{topic}" on 4 dimensions (1-10 each):
-
-- factuality: are claims backed by data/examples?
-- structure: clear intro, body sections, conclusion?
-- seo: is the title compelling, keywords used naturally?
-- readability: fluent, scannable, engaging?
-
-Article (first 1500 chars):
-{article[:1500]}
-
-Return ONLY a JSON object, no other text:
-{{"factuality": N, "structure": N, "seo": N, "readability": N, "average": N}}"""
-    t0 = time.time()
-    msg = llm.invoke([HumanMessage(content=prompt)])
-    elapsed = time.time() - t0
-    content = msg.content.strip()
-
-    m = re.search(r'average[\s:]+(\d+(?:\.\d+)?)', content)
-    score = int(float(m.group(1))) if m else 5
-    print(f"  ⏱ 评估: {elapsed:.1f}s | score={score}/10 | {content[:120]}")
-    return {"quality_score": score}
-
+    
+    print(f"\n{'='*50}\n🏅 工业级 LLM 质量评估 (第{attempts}次)\n{'='*50}")
+    
+    # 2. 利用 LangChain 的 with_structured_output 强行约束 DeepSeek 返回标准 JSON
+    # 这从根本上干掉了正则，防御了格式坍塌
+    structured_llm = llm.with_structured_output(QualityReport)
+    
+    prompt = f"请严格评估关于 '{topic}' 的文章，并给出详细的反馈意见。"
+    
+    try:
+        t0 = time.time()
+        # 传入文章和 Prompt
+        report: QualityReport = structured_llm.invoke([
+            SystemMessage(content="你是一个冷酷、严苛的博客总编。"),
+            HumanMessage(content=f"{prompt}\n\n文章内容:\n{article}")
+        ])
+        elapsed = time.time() - t0
+        
+        print(f" ⏱ 评估耗时: {elapsed:.1f}s | 平均分: {report.average} | 反馈: {report.feedback[:50]}...")
+        
+        # 3. 核心改进：把修改意见 (review_feedback) 写回全局状态！
+        return {
+            "quality_score": int(report.average),
+            "review_feedback": report.feedback  # 下一个节点（merge_and_polish）可以直接读取这个反馈进行定向大修！
+        }
+    except Exception as e:
+        print(f" ❌ 质检异常，降级处理: {e}")
+        return {"quality_score": 5, "review_feedback": "格式解析失败，请重新整体润色并检查文章健壮性。"}
 
 def finalize(state: AgentState) -> dict:
     """Generate 3 alternative titles & 2 tweet hooks from the finished article."""
